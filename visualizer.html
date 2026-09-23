@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Inference Internals — KV Cache & Batching Visualizer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F5F6F8;
+    --surface: #FFFFFF;
+    --surface-2: #EEF0F3;
+    --border: #D7DBE2;
+    --text: #171A21;
+    --text-muted: #5B6272;
+    --accent-prefill: #C97B18;
+    --accent-decode: #0E8A76;
+    --accent-stall: #C4423A;
+    --accent-idle: #B7BDC9;
+    --radius: 4px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0F1320;
+      --surface: #1A1F2B;
+      --surface-2: #212736;
+      --border: #2A303F;
+      --text: #EAEDF2;
+      --text-muted: #8891A3;
+      --accent-prefill: #F2A93C;
+      --accent-decode: #3FC6B0;
+      --accent-stall: #E8615D;
+      --accent-idle: #3A4152;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0F1320;
+    --surface: #1A1F2B;
+    --surface-2: #212736;
+    --border: #2A303F;
+    --text: #EAEDF2;
+    --text-muted: #8891A3;
+    --accent-prefill: #F2A93C;
+    --accent-decode: #3FC6B0;
+    --accent-stall: #E8615D;
+    --accent-idle: #3A4152;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+
+  .wrap {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+
+  header.page-head {
+    margin-bottom: 56px;
+    padding-bottom: 32px;
+    border-bottom: 1px solid var(--border);
+  }
+  header.page-head h1 {
+    font-size: 28px;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+  }
+  header.page-head p {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--text-muted);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  section.block {
+    margin-bottom: 64px;
+  }
+  section.block h2 {
+    font-size: 19px;
+    font-weight: 700;
+    margin: 0 0 6px;
+  }
+  section.block > p.desc {
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--text-muted);
+    max-width: 68ch;
+    margin: 0 0 24px;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+  }
+
+  /* --- KV Cache Calculator --- */
+  .controls-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px 28px;
+    margin-bottom: 24px;
+  }
+  .control {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .control label {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+  }
+  .control label span.val {
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--text);
+    font-weight: 500;
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent-decode);
+    height: 4px;
+  }
+  select {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: var(--radius);
+    padding: 7px 10px;
+    font-family: 'Manrope', sans-serif;
+    font-size: 13.5px;
+  }
+
+  .kv-result {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .kv-stat {
+    background: var(--surface-2);
+    padding: 16px 18px;
+  }
+  .kv-stat .label {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  .kv-stat .value {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 22px;
+    font-weight: 600;
+  }
+  .kv-stat .value.warn { color: var(--accent-stall); }
+
+  .mem-bar-row { margin-bottom: 10px; }
+  .mem-bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  .mem-bar-track {
+    position: relative;
+    height: 22px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .mem-bar-fill {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    transition: width 0.4s ease;
+  }
+  .mem-bar-fill.weights { background: var(--text-muted); opacity: 0.5; }
+  .mem-bar-fill.kv { background: var(--accent-decode); }
+  .mem-ref-line {
+    position: absolute; top: 0; bottom: 0; width: 1px;
+    background: var(--text-muted); opacity: 0.6;
+  }
+  .mem-ref-label {
+    position: absolute; top: -18px; font-size: 10px; color: var(--text-muted);
+    transform: translateX(-50%);
+    white-space: nowrap;
+  }
+
+  /* --- Gantt-style timelines --- */
+  .gantt {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 16px 0 8px;
+  }
+  .gantt-row { display: flex; align-items: center; gap: 10px; }
+  .gantt-row-label {
+    width: 54px;
+    flex-shrink: 0;
+    font-size: 11.5px;
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--text-muted);
+    text-align: right;
+  }
+  .gantt-track {
+    position: relative;
+    flex: 1;
+    height: 24px;
+    background: var(--surface-2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .gantt-seg {
+    position: absolute; top: 0; bottom: 0;
+    border-radius: 2px;
+    opacity: 0;
+    transform: scaleX(0.85);
+    transform-origin: left;
+    animation: seg-in 0.5s ease forwards;
+  }
+  @keyframes seg-in { to { opacity: 1; transform: scaleX(1); } }
+  .gantt-seg.prefill { background: var(--accent-prefill); }
+  .gantt-seg.decode { background: var(--accent-decode); }
+  .gantt-seg.idle {
+    background: repeating-linear-gradient(45deg, var(--accent-idle), var(--accent-idle) 4px, transparent 4px, transparent 8px);
+    opacity: 0.5 !important;
+  }
+  .gantt-seg.stall { background: var(--accent-stall); }
+  .gantt-seg:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: 130%;
+    left: 0;
+    background: var(--text);
+    color: var(--bg);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px;
+    padding: 4px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+    z-index: 5;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+
+  .metrics-row {
+    display: flex;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-top: 18px;
+  }
+  .metric-cell {
+    flex: 1;
+    background: var(--surface-2);
+    padding: 12px 16px;
+  }
+  .metric-cell .label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+  .metric-cell .value { font-family: 'IBM Plex Mono', monospace; font-size: 17px; font-weight: 600; }
+
+  .compare-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 680px) {
+    .compare-grid { grid-template-columns: 1fr; }
+  }
+  .compare-col h3 {
+    font-size: 13px;
+    font-weight: 700;
+    margin: 0 0 12px;
+    color: var(--text-muted);
+  }
+
+  footer.note {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    padding-top: 20px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page-head">
+    <h1>KV Cache & Batching Visualizer</h1>
+    <p>Three small simulators built to make the mechanics of LLM inference serving tangible: how KV cache memory scales, why continuous batching beats static batching, and why chunked prefill exists. Companion piece to a multi-provider inference benchmarking project.</p>
+  </header>
+
+  <!-- SECTION 1: KV CACHE CALCULATOR -->
+  <section class="block">
+    <h2>KV cache memory calculator</h2>
+    <p class="desc">Every token held in a request's context requires storing key and value vectors at every layer. This grows linearly with layers, sequence length, and batch size — and at scale, often exceeds the memory footprint of the model's own weights.</p>
+    <div class="panel">
+      <div class="controls-grid">
+        <div class="control">
+          <label>Layers <span class="val mono" id="v-layers">32</span></label>
+          <input type="range" id="layers" min="8" max="96" step="4" value="32">
+        </div>
+        <div class="control">
+          <label>Attention heads <span class="val mono" id="v-heads">32</span></label>
+          <input type="range" id="heads" min="8" max="96" step="4" value="32">
+        </div>
+        <div class="control">
+          <label>Head dimension <span class="val mono" id="v-headdim">128</span></label>
+          <input type="range" id="headdim" min="64" max="256" step="32" value="128">
+        </div>
+        <div class="control">
+          <label>Sequence length <span class="val mono" id="v-seqlen">4,096</span></label>
+          <input type="range" id="seqlen" min="512" max="32768" step="512" value="4096">
+        </div>
+        <div class="control">
+          <label>Batch size <span class="val mono" id="v-batch">8</span></label>
+          <input type="range" id="batch" min="1" max="64" step="1" value="8">
+        </div>
+        <div class="control">
+          <label>Precision</label>
+          <select id="precision">
+            <option value="2" selected>FP16 / BF16 (2 bytes)</option>
+            <option value="1">FP8 (1 byte)</option>
+            <option value="4">FP32 (4 bytes)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="kv-result">
+        <div class="kv-stat">
+          <div class="label">KV cache size</div>
+          <div class="value" id="kv-size">—</div>
+        </div>
+        <div class="kv-stat">
+          <div class="label">Est. model weights</div>
+          <div class="value" id="weights-size">—</div>
+        </div>
+        <div class="kv-stat">
+          <div class="label">KV cache : weights ratio</div>
+          <div class="value" id="ratio">—</div>
+        </div>
+      </div>
+
+      <div class="mem-bar-row">
+        <div class="mem-bar-label"><span>Total memory vs. common GPU capacities</span></div>
+        <div class="mem-bar-track" id="mem-track">
+          <div class="mem-bar-fill weights" id="bar-weights"></div>
+          <div class="mem-bar-fill kv" id="bar-kv"></div>
+        </div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--text-muted);opacity:.5;"></span>Model weights</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-decode);"></span>KV cache</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 2: STATIC VS CONTINUOUS BATCHING -->
+  <section class="block">
+    <h2>Static vs. continuous batching</h2>
+    <p class="desc">Same 8 requests, same 4 GPU slots. Static batching holds every slot until the longest request in the batch finishes before admitting new work. Continuous batching replaces a finished slot immediately — no batch boundary to wait for.</p>
+    <div class="panel">
+      <div class="compare-grid">
+        <div class="compare-col">
+          <h3>Static batching</h3>
+          <div class="gantt" id="gantt-static"></div>
+          <div class="metrics-row">
+            <div class="metric-cell"><div class="label">Total time</div><div class="value" id="static-total">—</div></div>
+            <div class="metric-cell"><div class="label">GPU idle</div><div class="value" id="static-idle">—</div></div>
+          </div>
+        </div>
+        <div class="compare-col">
+          <h3>Continuous batching</h3>
+          <div class="gantt" id="gantt-continuous"></div>
+          <div class="metrics-row">
+            <div class="metric-cell"><div class="label">Total time</div><div class="value" id="cont-total">—</div></div>
+            <div class="metric-cell"><div class="label">GPU idle</div><div class="value" id="cont-idle">—</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-prefill);"></span>Prefill</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-decode);"></span>Decode</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:repeating-linear-gradient(45deg,var(--accent-idle),var(--accent-idle) 3px,transparent 3px,transparent 6px);opacity:.6;"></span>Idle (slot held, unused)</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 3: CHUNKED VS UNCHUNKED PREFILL -->
+  <section class="block">
+    <h2>Chunked vs. unchunked prefill</h2>
+    <p class="desc">Three requests (A, B, C) are decoding steadily when a fourth request with a long prompt arrives. Without chunking, its entire prefill runs as one uninterrupted block — stalling everyone else's decode. Chunking breaks it up and interleaves it, trading a slightly later finish for D against eliminating the stall for A, B, and C. (Schematic, not cycle-accurate.)</p>
+    <div class="panel">
+      <div class="compare-grid">
+        <div class="compare-col">
+          <h3>Unchunked prefill</h3>
+          <div class="gantt" id="gantt-unchunked"></div>
+          <div class="metrics-row">
+            <div class="metric-cell"><div class="label">Max decode stall</div><div class="value" id="unchunked-stall">—</div></div>
+            <div class="metric-cell"><div class="label">D prefill done</div><div class="value" id="unchunked-done">—</div></div>
+          </div>
+        </div>
+        <div class="compare-col">
+          <h3>Chunked prefill</h3>
+          <div class="gantt" id="gantt-chunked"></div>
+          <div class="metrics-row">
+            <div class="metric-cell"><div class="label">Max decode stall</div><div class="value" id="chunked-stall">—</div></div>
+            <div class="metric-cell"><div class="label">D prefill done</div><div class="value" id="chunked-done">—</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-prefill);"></span>D's prefill (chunk)</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-decode);"></span>Decode tick (A/B/C)</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent-stall);"></span>Stalled — waiting on prefill</div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="note">
+    Companion visualizer for a multi-provider inference benchmarking project (Groq vs. OpenRouter). Formulas and behavior follow standard transformer serving mechanics; the batching and chunked-prefill panels use illustrative fixed datasets, not live simulation of a real scheduler.
+  </footer>
+
+</div>
+
+<script>
+(function() {
+  // ---------- SECTION 1: KV CACHE CALCULATOR ----------
+  const els = {
+    layers: document.getElementById('layers'),
+    heads: document.getElementById('heads'),
+    headdim: document.getElementById('headdim'),
+    seqlen: document.getElementById('seqlen'),
+    batch: document.getElementById('batch'),
+    precision: document.getElementById('precision'),
+  };
+  const vEls = {
+    layers: document.getElementById('v-layers'),
+    heads: document.getElementById('v-heads'),
+    headdim: document.getElementById('v-headdim'),
+    seqlen: document.getElementById('v-seqlen'),
+    batch: document.getElementById('v-batch'),
+  };
+
+  function fmtNum(n) { return n.toLocaleString('en-US'); }
+  function fmtBytes(bytes) {
+    if (bytes >= 1e12) return (bytes/1e12).toFixed(2) + ' TB';
+    if (bytes >= 1e9) return (bytes/1e9).toFixed(2) + ' GB';
+    if (bytes >= 1e6) return (bytes/1e6).toFixed(1) + ' MB';
+    return bytes.toFixed(0) + ' B';
+  }
+
+  const GPU_REFS = [
+    { label: '24GB', bytes: 24e9 },
+    { label: '80GB', bytes: 80e9 },
+    { label: '141GB', bytes: 141e9 },
+  ];
+
+  function recompute() {
+    const L = parseInt(els.layers.value, 10);
+    const H = parseInt(els.heads.value, 10);
+    const D = parseInt(els.headdim.value, 10);
+    const S = parseInt(els.seqlen.value, 10);
+    const B = parseInt(els.batch.value, 10);
+    const bytesPerVal = parseInt(els.precision.value, 10);
+
+    vEls.layers.textContent = L;
+    vEls.heads.textContent = H;
+    vEls.headdim.textContent = D;
+    vEls.seqlen.textContent = fmtNum(S);
+    vEls.batch.textContent = B;
+
+    // KV cache: 2 (K and V) * layers * heads * headDim * seqLen * batch * bytesPerVal
+    const kvBytes = 2 * L * H * D * S * B * bytesPerVal;
+
+    // rough weight estimate: standard transformer ~ 12 * L * hiddenDim^2 params
+    const hidden = H * D;
+    const paramCount = 12 * L * hidden * hidden;
+    const weightBytes = paramCount * bytesPerVal;
+
+    document.getElementById('kv-size').textContent = fmtBytes(kvBytes);
+    document.getElementById('weights-size').textContent = fmtBytes(weightBytes);
+    const ratio = kvBytes / weightBytes;
+    const ratioEl = document.getElementById('ratio');
+    ratioEl.textContent = ratio.toFixed(2) + '×';
+    ratioEl.className = 'value' + (ratio > 1 ? ' warn' : '');
+
+    // memory bar vs GPU refs
+    const maxRef = GPU_REFS[GPU_REFS.length - 1].bytes * 1.15;
+    const total = kvBytes + weightBytes;
+    const scaleMax = Math.max(total * 1.1, maxRef);
+
+    const track = document.getElementById('mem-track');
+    track.querySelectorAll('.mem-ref-line, .mem-ref-label').forEach(e => e.remove());
+    GPU_REFS.forEach(ref => {
+      const pct = Math.min(100, (ref.bytes / scaleMax) * 100);
+      const line = document.createElement('div');
+      line.className = 'mem-ref-line';
+      line.style.left = pct + '%';
+      const label = document.createElement('div');
+      label.className = 'mem-ref-label';
+      label.style.left = pct + '%';
+      label.textContent = ref.label;
+      track.appendChild(line);
+      track.appendChild(label);
+    });
+
+    const wPct = Math.min(100, (weightBytes / scaleMax) * 100);
+    const kvPct = Math.min(100 - wPct, (kvBytes / scaleMax) * 100);
+    document.getElementById('bar-weights').style.width = wPct + '%';
+    document.getElementById('bar-kv').style.left = wPct + '%';
+    document.getElementById('bar-kv').style.width = kvPct + '%';
+  }
+
+  Object.values(els).forEach(el => el.addEventListener('input', recompute));
+  recompute();
+
+  // ---------- SECTION 2: STATIC VS CONTINUOUS BATCHING ----------
+  const requests = [
+    { id: 'R1', prefill: 2, decode: 3 },
+    { id: 'R2', prefill: 2, decode: 8 },
+    { id: 'R3', prefill: 6, decode: 3 },
+    { id: 'R4', prefill: 2, decode: 2 },
+    { id: 'R5', prefill: 6, decode: 9 },
+    { id: 'R6', prefill: 2, decode: 4 },
+    { id: 'R7', prefill: 3, decode: 2 },
+    { id: 'R8', prefill: 2, decode: 6 },
+  ];
+  const SLOTS = 4;
+
+  function computeStatic(reqs, slots) {
+    const timeline = [];
+    let time = 0;
+    for (let i = 0; i < reqs.length; i += slots) {
+      const batch = reqs.slice(i, i + slots);
+      const batchStart = time;
+      const ends = batch.map(r => batchStart + r.prefill + r.decode);
+      const batchEnd = Math.max(...ends);
+      batch.forEach((r, slotIdx) => {
+        const start = batchStart;
+        const prefillEnd = start + r.prefill;
+        const decodeEnd = prefillEnd + r.decode;
+        timeline.push({ slot: slotIdx, id: r.id, start, prefillEnd, decodeEnd, rowEnd: batchEnd });
+      });
+      time = batchEnd;
+    }
+    return { timeline, total: time };
+  }
+
+  function computeContinuous(reqs, slots) {
+    const slotFree = new Array(slots).fill(0);
+    const timeline = [];
+    reqs.forEach(r => {
+      let slotIdx = 0;
+      for (let i = 1; i < slots; i++) if (slotFree[i] < slotFree[slotIdx]) slotIdx = i;
+      const start = slotFree[slotIdx];
+      const prefillEnd = start + r.prefill;
+      const decodeEnd = prefillEnd + r.decode;
+      timeline.push({ slot: slotIdx, id: r.id, start, prefillEnd, decodeEnd, rowEnd: decodeEnd });
+      slotFree[slotIdx] = decodeEnd;
+    });
+    return { timeline, total: Math.max(...slotFree) };
+  }
+
+  function busyTotal(reqs) {
+    return reqs.reduce((s, r) => s + r.prefill + r.decode, 0);
+  }
+
+  function renderGantt(containerId, result, slots, totalOverride) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = '';
+    const total = totalOverride || result.total;
+    for (let s = 0; s < slots; s++) {
+      const row = document.createElement('div');
+      row.className = 'gantt-row';
+      const label = document.createElement('div');
+      label.className = 'gantt-row-label mono';
+      label.textContent = 'slot ' + (s + 1);
+      const track = document.createElement('div');
+      track.className = 'gantt-track';
+
+      const items = result.timeline.filter(t => t.slot === s).sort((a,b) => a.start - b.start);
+      items.forEach((item, idx) => {
+        const pFrom = item.start / total * 100;
+        const pWidth = (item.prefillEnd - item.start) / total * 100;
+        const dWidth = (item.decodeEnd - item.prefillEnd) / total * 100;
+        const pSeg = document.createElement('div');
+        pSeg.className = 'gantt-seg prefill';
+        pSeg.style.left = pFrom + '%';
+        pSeg.style.width = pWidth + '%';
+        pSeg.style.animationDelay = (idx * 0.05) + 's';
+        pSeg.dataset.tip = item.id + ' prefill';
+        track.appendChild(pSeg);
+
+        const dSeg = document.createElement('div');
+        dSeg.className = 'gantt-seg decode';
+        dSeg.style.left = (pFrom + pWidth) + '%';
+        dSeg.style.width = dWidth + '%';
+        dSeg.style.animationDelay = (idx * 0.05 + 0.03) + 's';
+        dSeg.dataset.tip = item.id + ' decode';
+        track.appendChild(dSeg);
+
+        if (item.rowEnd > item.decodeEnd) {
+          const iWidth = (item.rowEnd - item.decodeEnd) / total * 100;
+          const iSeg = document.createElement('div');
+          iSeg.className = 'gantt-seg idle';
+          iSeg.style.left = (item.decodeEnd / total * 100) + '%';
+          iSeg.style.width = iWidth + '%';
+          iSeg.style.animationDelay = (idx * 0.05 + 0.06) + 's';
+          iSeg.dataset.tip = 'slot idle (held, unused)';
+          track.appendChild(iSeg);
+        }
+      });
+
+      row.appendChild(label);
+      row.appendChild(track);
+      container.appendChild(row);
+    }
+  }
+
+  const staticResult = computeStatic(requests, SLOTS);
+  const contResult = computeContinuous(requests, SLOTS);
+  const busy = busyTotal(requests);
+
+  const sharedTotal = Math.max(staticResult.total, contResult.total);
+  renderGantt('gantt-static', staticResult, SLOTS, sharedTotal);
+  renderGantt('gantt-continuous', contResult, SLOTS, sharedTotal);
+
+  document.getElementById('static-total').textContent = staticResult.total + ' units';
+  document.getElementById('cont-total').textContent = contResult.total + ' units';
+  document.getElementById('static-idle').textContent =
+    Math.round((1 - busy / (SLOTS * staticResult.total)) * 100) + '%';
+  document.getElementById('cont-idle').textContent =
+    Math.round((1 - busy / (SLOTS * contResult.total)) * 100) + '%';
+
+  // ---------- SECTION 3: CHUNKED VS UNCHUNKED PREFILL ----------
+  const WINDOW = 20;
+  const TICK_ROWS = ['A', 'B', 'C'];
+
+  function buildUnchunked() {
+    const gpuSegs = [];
+    for (let t = 0; t < 5; t++) gpuSegs.push({ start: t, end: t + 1, type: 'decode', tip: 'decode batch step' });
+    gpuSegs.push({ start: 5, end: 10, type: 'prefill', tip: 'D prefill (full block)' });
+    for (let t = 10; t < WINDOW; t++) gpuSegs.push({ start: t, end: t + 1, type: 'decode', tip: 'decode batch step' });
+
+    const rows = {};
+    TICK_ROWS.forEach(r => {
+      const segs = [];
+      for (let t = 0; t < WINDOW; t++) {
+        if (t >= 5 && t < 10) {
+          if (t === 5) segs.push({ start: 5, end: 10, type: 'stall', tip: r + ' stalled — waiting on D prefill' });
+        } else {
+          segs.push({ start: t, end: t + 0.6, type: 'decode', tip: r + ' decode tick' });
+        }
+      }
+      rows[r] = segs;
+    });
+    return { gpuSegs, rows, maxStall: 5, doneAt: 10 };
+  }
+
+  function buildChunked() {
+    const chunkStarts = [5, 7, 9, 11, 13];
+    const gpuSegs = [];
+    let t = 0;
+    chunkStarts.forEach(cs => {
+      while (t < cs) { gpuSegs.push({ start: t, end: t + 1, type: 'decode', tip: 'decode batch step' }); t++; }
+      gpuSegs.push({ start: cs, end: cs + 1, type: 'prefill', tip: 'D prefill chunk' });
+      t = cs + 1;
+    });
+    while (t < WINDOW) { gpuSegs.push({ start: t, end: t + 1, type: 'decode', tip: 'decode batch step' }); t++; }
+
+    const rows = {};
+    TICK_ROWS.forEach(r => {
+      const segs = [];
+      for (let tt = 0; tt < WINDOW; tt++) {
+        if (chunkStarts.includes(tt)) {
+          segs.push({ start: tt, end: tt + 1, type: 'stall', tip: r + ' — brief 1-unit delay (chunk boundary)' });
+        } else {
+          segs.push({ start: tt, end: tt + 0.6, type: 'decode', tip: r + ' decode tick' });
+        }
+      }
+      rows[r] = segs;
+    });
+    return { gpuSegs, rows, maxStall: 1, doneAt: 14 };
+  }
+
+  function renderPrefillGantt(containerId, data) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = '';
+
+    function makeRow(label, segs) {
+      const row = document.createElement('div');
+      row.className = 'gantt-row';
+      const lbl = document.createElement('div');
+      lbl.className = 'gantt-row-label mono';
+      lbl.textContent = label;
+      const track = document.createElement('div');
+      track.className = 'gantt-track';
+      segs.forEach((s, idx) => {
+        const seg = document.createElement('div');
+        seg.className = 'gantt-seg ' + s.type;
+        seg.style.left = (s.start / WINDOW * 100) + '%';
+        seg.style.width = Math.max(0.5, (s.end - s.start) / WINDOW * 100) + '%';
+        seg.style.animationDelay = (idx * 0.015) + 's';
+        seg.dataset.tip = s.tip;
+        track.appendChild(seg);
+      });
+      row.appendChild(lbl);
+      row.appendChild(track);
+      return row;
+    }
+
+    container.appendChild(makeRow('GPU', data.gpuSegs));
+    TICK_ROWS.forEach(r => container.appendChild(makeRow(r, data.rows[r])));
+  }
+
+  const unchunked = buildUnchunked();
+  const chunked = buildChunked();
+  renderPrefillGantt('gantt-unchunked', unchunked);
+  renderPrefillGantt('gantt-chunked', chunked);
+
+  document.getElementById('unchunked-stall').textContent = unchunked.maxStall + ' units';
+  document.getElementById('unchunked-done').textContent = 't=' + unchunked.doneAt;
+  document.getElementById('chunked-stall').textContent = chunked.maxStall + ' unit';
+  document.getElementById('chunked-done').textContent = 't=' + chunked.doneAt;
+})();
+</script>
+</body>
+</html>
