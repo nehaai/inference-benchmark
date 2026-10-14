@@ -9,11 +9,19 @@ providers under varying concurrency — Groq (GPT-OSS 120B) vs OpenRouter
 8 fixed prompts (short/long input × short/long output), streamed and run
 at concurrency 1, 5, and 10. Measures:
 - **TTFT** — time to first content token
-- **TPOT** — avg time between output tokens (decode speed)
+- **TPOT** — decode time per output token, from billed token counts
+- **Throughput** — output tokens per second across the whole run
 - **Reasoning vs. content tokens** — thinking time isolated from answer generation
-- Cost per request (published per-token rates)
+- Cost per request (billed token usage × published rates)
+- Retries, retry wait, and failed or truncated requests, reported separately
+
+Stats are p50/p95, not averages.
 
 ## Findings
+
+> **Withdrawn until rerun.** The numbers below came from the v1 harness,
+> which had measurement bugs (see `CHANGELOG.md`). The TPOT figures in
+> particular are wrong: OpenRouter's were overstated by about 3×.
 
 | Finding | Data |
 |---|---|
@@ -28,27 +36,25 @@ at concurrency 1, 5, and 10. Measures:
   concurrency is likely outlier noise, not a real trend
 - Different model families (~120B params each), not identical models
 - Self-hosted/quantized comparison out of scope (avoided GPU cost)
-- Cost figures use word-count as a token proxy, not a real tokenizer
 
 ## Structure
 
 - `prompts.py` — frozen test set
 - `benchmark.py` — harness: streaming, instrumentation, retry logic, SQLite logging
-- `compare_providers.py` — aggregate comparison by provider/concurrency
+- `compare_providers.py` — p50/p95, fail rate and throughput by provider/concurrency
 - `build_dashboard.py` — generates `dashboard.html`
+- `visualizer.html` — standalone KV cache explainer (not benchmark output)
+- `CHANGELOG.md` — what was fixed in the harness, and why
 
 ## Run
 
 ```bash
 python -m venv venv && source venv/bin/activate
-pip install openai python-dotenv plotly pandas
+pip install -r requirements.txt
 # .env: GROQ_API_KEY=..., OPENROUTER_API_KEY=...
 
-python -c "
-from benchmark import run_all_prompts
-for c in [1, 5, 10]:
-    run_all_prompts(concurrency=c)
-"
+rm -f results.db        # v1 databases have an incompatible schema
+python benchmark.py      # concurrency 1, 5, 10
 python compare_providers.py
 python build_dashboard.py
 ```
