@@ -35,7 +35,9 @@ PROVIDERS = {
     },
 }
 
-MAX_COMPLETION_TOKENS = 2048
+# Reasoning models spend part of this budget thinking before any content.
+# At 2048, long-output prompts ran out mid-reasoning and returned nothing.
+MAX_COMPLETION_TOKENS = 4096
 WARMUP_PROMPT = "Reply with the single word: ok"
 
 
@@ -215,10 +217,13 @@ def _run_single_request_inner(client, model: str, cost_per_1m_output: float,
         if completion_tokens is not None else None
     )
 
-    if first_content_time is None:
-        status = "no_content"
-    elif finish_reason == "length":
+    # Check the token budget first: a request that hit max_tokens is
+    # "truncated" whether or not it got to the answer. "no_content" is
+    # reserved for a stream that ended normally with nothing in it.
+    if finish_reason == "length":
         status = "truncated"
+    elif first_content_time is None:
+        status = "no_content"
     else:
         status = "ok"
 

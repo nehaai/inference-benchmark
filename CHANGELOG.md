@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.1: token budget and status labels
+
+Found by the first real v2 run (2026-10-13).
+
+**Raised the output budget from 2,048 to 4,096 tokens.** Every request
+labelled `no_content` had stopped at exactly 2,048 tokens with only
+reasoning, no answer. Reasoning models spend part of the budget thinking
+before they write anything, and long-output prompts ran out first. That
+measured the request settings, not the provider.
+
+**`finish_reason=length` is now always `truncated`.** The status check
+looked for missing content before checking the token budget, so a request
+that ran out of tokens mid-reasoning was labelled `no_content` and counted
+as a failure. Now any request that hits the budget is `truncated`, and
+`no_content` only means a stream that ended normally with nothing in it.
+
+**README findings rewritten** from the first v2 run.
+
 ## v2: measurement fixes
 
 v1 produced numbers that looked plausible but were measured wrong. Every
